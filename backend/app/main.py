@@ -38,6 +38,17 @@ app.include_router(integrations.router, prefix=API)
 app.include_router(findings.router, prefix=API)
 
 
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "app": settings.APP_NAME,
+        "version": settings.APP_VERSION,
+        "health": "/api/v1/health",
+        "docs": "/docs",
+    }
+
+
 @app.get("/api/v1/health")
 def health():
     return {

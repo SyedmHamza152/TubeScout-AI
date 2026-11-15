@@ -1,6 +1,7 @@
 node_modules
 .next
 audit
+backend
 db
 upload
 download
@@ -18,7 +19,6 @@ server.log
 **/.venv
 **/__pycache__
 *.pyc
-backend/data
 Dockerfile
 .dockerignore
 docker-compose.yml

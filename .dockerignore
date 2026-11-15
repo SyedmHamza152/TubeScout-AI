@@ -1,0 +1,14 @@
+node_modules
+.next
+audit
+backend
+.git
+*.log
+dev.log
+server.log
+**/.env
+**/.env.*
+!.env.example
+Dockerfile
+.dockerignore
+render.yaml

@@ -1,0 +1,742 @@
+     1→"""Live data sources that work WITHOUT credentials (verified reachable).
+     2→
+     3→Connectivity matrix verified from this deployment (2026-10, curl probes):
+     4→
+     5→| Source              | Endpoint                                        | Result          |
+     6→|---------------------|--------------------------------------------------|-----------------|
+     7→| Reddit archive      | arctic-shift.photon-reddit.com/api/*             | LIVE (200)      |
+     8→| Hacker News         | hn.algolia.com/api/v1/*                          | LIVE (200)      |
+     9→| YouTube comments    | www.youtube.com/youtubei/v1 search + next        | LIVE (200)      |
+    10→| Daraz PK storefront | www.daraz.pk/catalog/?q=...&ajax=true            | LIVE (200)      |
+    11→| Daraz review TEXT   | acs-m.daraz.pk mtop gateway / getReviewList      | IP-blocked (RGV587 cloud_ip_bl) |
+    12→| reddit.com JSON     | www.reddit.com/*.json (unauthenticated)          | 403 datacenter  |
+    13→| X / eBay            | api.x.com / api.ebay.com                         | reachable, needs key |
+    14→| YouTube Data API v3 | googleapis.com (official, when key configured)   | reachable, needs key |
+    15→| Daraz Open Platform | open.daraz.com                                   | needs app key   |
+    16→
+    17→Everything collected here comes VERBATIM from the upstream platform APIs.
+    18→No synthetic content is produced by this module, ever.
+    19→
+    20→Reddit access rationale: reddit.com blocks datacenter IPs for unauthenticated
+    21→JSON, so we use the Arctic-Shift public archive of Reddit submissions and
+    22→comments (complete Reddit history, served read-only). When official OAuth
+    23→credentials are configured, the Reddit adapter uses the official API instead
+    24→(richer ranking, same schema).
+    25→"""
+    26→from __future__ import annotations
+    27→
+    28→import html
+    29→import logging
+    30→import re
+    31→import time
+    32→from datetime import datetime, timedelta, timezone
+    33→from urllib.parse import quote_plus
+    34→
+    35→import requests
+    36→
+    37→from app.core.config import settings
+    38→from app.integrations.base import AdapterResult, AdapterStatus, BaseAdapter, ReviewItem
+    39→
+    40→log = logging.getLogger("live_sources")
+    41→
+    42→UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    43→      "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+    44→
+    45→REMOVED_BODIES = {"[deleted]", "[removed]", ""}
+    46→
+    47→
+    48→# ---------------------------------------------------------------- arctic-shift
+    49→class ArcticShiftClient:
+    50→    """Thin client for the public Arctic-Shift Reddit archive API.
+    51→
+    52→    The archive's server-side text search (body=/title= params) is heavy and
+    53→    aggressively rate-limited (HTTP 422 + "Timeout. Maybe slow down a bit")
+    54→    under bursts, while plain per-subreddit fetches are cheap and reliable.
+    55→    Strategy: fetch recent posts/comments per subreddit (light endpoints) and
+    56→    filter for product mentions locally; text search is only an opportunistic
+    57→    booster and is disabled for the rest of the job once throttled.
+    58→    """
+    59→
+    60→    BASE = "https://arctic-shift.photon-reddit.com/api"
+    61→
+    62→    def __init__(self) -> None:
+    63→        self._last_call = 0.0
+    64→        self._calls = 0
+    65→        self.text_search_available = True  # flips False on first 422 throttle
+    66→
+    67→    def get(self, path: str, params: dict, retries: int = 2,
+    68→            text_search: bool = False) -> list | None:
+    69→        wait = settings.ARCTIC_MIN_INTERVAL_SECONDS - (time.time() - self._last_call)
+    70→        if wait > 0:
+    71→            time.sleep(wait)
+    72→        if text_search and not self.text_search_available:
+    73→            return None
+    74→        backoff = 4.0
+    75→        for attempt in range(retries + 1):
+    76→            self._calls += 1
+    77→            self._last_call = time.time()
+    78→            try:
+    79→                resp = requests.get(
+    80→                    f"{self.BASE}/{path}", params=params,
+    81→                    headers={"User-Agent": settings.REDDIT_USER_AGENT},
+    82→                    timeout=40,
+    83→                )
+    84→                if resp.status_code == 422 or (
+    85→                    resp.status_code == 200 and "Timeout" in (resp.json() or {}).get("error", "")
+    86→                    if resp.headers.get("content-type", "").startswith("application/json")
+    87→                    else False
+    88→                ):
+    89→                    # rate-limited / server-side search timeout
+    90→                    if text_search:
+    91→                        self.text_search_available = False
+    92→                        log.info("arctic text search throttled; falling back to fetch-and-filter")
+    93→                        return None
+    94→                    if attempt < retries:
+    95→                        time.sleep(backoff)
+    96→                        backoff *= 2
+    97→                        continue
+    98→                    return None
+    99→                if resp.status_code != 200:
+   100→                    log.warning("arctic %s HTTP %s", path, resp.status_code)
+   101→                    return None
+   102→                payload = resp.json()
+   103→                data = payload.get("data")
+   104→                if data is None:
+   105→                    err = payload.get("error", "")
+   106→                    if err:
+   107→                        log.warning("arctic %s error: %s", path, err)
+   108→                    return []
+   109→                return data
+   110→            except requests.RequestException as exc:
+   111→                log.warning("arctic %s network error: %s", path, exc)
+   112→                if attempt < retries:
+   113→                    time.sleep(backoff)
+   114→                    backoff *= 2
+   115→            except ValueError:  # non-JSON body
+   116→                return None
+   117→        return None
+   118→
+   119→
+   120→GENERIC_TOKENS = {"the", "and", "for", "with", "new", "pro", "max", "mini",
+   121→                  "plus", "air", "one", "two", "series", "edition", "version"}
+   122→
+   123→
+   124→def _mention_tokens(product_name: str) -> list[str]:
+   125→    """Distinctive lowercase tokens used for local mention filtering."""
+   126→    words = re.findall(r"[a-z0-9]{3,}", product_name.lower())
+   127→    strong = [w for w in words if w not in GENERIC_TOKENS] or words
+   128→    return strong or [product_name.lower()]
+   129→
+   130→
+   131→def _mentions(text: str, tokens: list[str]) -> bool:
+   132→    low = f" {re.sub(r'[^a-z0-9]+', ' ', text.lower())} "
+   133→    strong = [t for t in tokens if t not in GENERIC_TOKENS]
+   134→    if strong:
+   135→        return any(f" {t} " in low for t in strong)
+   136→    # generic-only product name (e.g. "Pro Max"): require the full phrase
+   137→    return f" {' '.join(tokens)} " in low
+   138→
+   139→
+   140→def collect_reddit(product_name: str, description: str | None,
+   141→                   max_items: int) -> AdapterResult:
+   142→    """Collect REAL Reddit posts + comments mentioning the product.
+   143→
+   144→    Primary path: fetch the latest posts and comments of each configured
+   145→    subreddit and match product tokens locally - light on the archive API.
+   146→    Booster: the archive's server-side text search (when not throttled) and
+   147→    comment-thread expansion for matched posts.
+   148→    """
+   149→    client = ArcticShiftClient()
+   150→    after = (datetime.now(timezone.utc) - timedelta(days=settings.REDDIT_LOOKBACK_DAYS)) \
+   151→        .strftime("%Y-%m-%d")
+   152→    subreddits = [s.strip() for s in settings.REDDIT_SUBREDDITS.split(",") if s.strip()]
+   153→    tokens = _mention_tokens(product_name)
+   154→    if not (product_name or "").strip():
+   155→        return AdapterResult("reddit", AdapterStatus.NO_RESULTS, "Empty product name.")
+   156→
+   157→    items: list[ReviewItem] = []
+   158→    seen_ids: set[str] = set()
+   159→    matched_post_ids: list[str] = []
+   160→
+   161→    def add(kind: str, d: dict, require_mention: bool = False) -> bool:
+   162→        ext = f"{kind}_{d.get('id', '')}"
+   163→        if ext in seen_ids:
+   164→            return False
+   165→        body = (d.get("body") or "").strip()
+   166→        title = (d.get("title") or "").strip()
+   167→        selftext = (d.get("selftext") or "").strip()
+   168→        # drop removal markers so 'SCAM ALERT [removed]' doesn't pollute text
+   169→        for marker in ("[removed]", "[deleted]"):
+   170→            body = body.replace(marker, "").strip()
+   171→            selftext = selftext.replace(marker, "").strip()
+   172→        text = " ".join(filter(None, [title, body, selftext])).strip()
+   173→        if text.lower() in REMOVED_BODIES or len(text) < 15:
+   174→            return False
+   175→        if (d.get("author") or "").lower().endswith("bot"):
+   176→            return False
+   177→        is_mention = _mentions(text, tokens)
+   178→        if require_mention and not is_mention:
+   179→            return False
+   180→        seen_ids.add(ext)
+   181→        link_id = (d.get("link_id") or "").replace("t3_", "")
+   182→        if kind == "t3" and is_mention:
+   183→            matched_post_ids.append(d.get("id", ""))
+   184→        permalink = d.get("permalink") or (
+   185→            f"/r/{d.get('subreddit', 'unknown')}/comments/{link_id}/_/{d.get('id', '')}/"
+   186→            if kind == "t1" else ""
+   187→        )
+   188→        created = d.get("created_utc")
+   189→        items.append(ReviewItem(
+   190→            external_id=ext,
+   191→            text=text[:1500],
+   192→            rating=None,
+   193→            review_date=datetime.fromtimestamp(created, tz=timezone.utc) if created else None,
+   194→            author=d.get("author"),
+   195→            source_url=f"https://www.reddit.com{permalink}" if permalink else None,
+   196→        ))
+   197→        return is_mention
+   198→
+   199→    # ---- 1) light fetch-and-filter per subreddit (always runs) ----
+   200→    for sub in subreddits:
+   201→        if len(items) >= max_items:
+   202→            break
+   203→        data = client.get("posts/search", {
+   204→            "subreddit": sub, "limit": 100, "sort": "desc", "after": after})
+   205→        for d in (data or []):
+   206→            add("t3", d, require_mention=True)   # keep product mentions only
+   207→    for sub in subreddits:
+   208→        if len(items) >= max_items:
+   209→            break
+   210→        data = client.get("comments/search", {
+   211→            "subreddit": sub, "limit": 100, "sort": "desc", "after": after})
+   212→        for d in (data or []):
+   213→            add("t1", d, require_mention=True)   # keep product mentions only
+   214→
+   215→    mentions_found = len(items)
+   216→
+   217→    # ---- 2) opportunistic text-search booster (skipped when throttled) ----
+   218→    booster_note = ""
+   219→    if client.text_search_available and mentions_found < max_items:
+   220→        for sub in subreddits[:6]:
+   221→            data = client.get("comments/search", {
+   222→                "subreddit": sub, "body": product_name,
+   223→                "limit": 50, "sort": "desc", "after": after}, text_search=True)
+   224→            if data is None:  # throttled -> disabled for the rest of the job
+   225→                booster_note = " (archive text-search rate-limited; used recent-window fetch)"
+   226→                break
+   227→            for d in data:
+   228→                add("t1", d, require_mention=True)
+   229→
+   230→    # ---- 3) expand matched posts' comment threads (light endpoint) ----
+   231→    # Thread comments are not pre-filtered: the pipeline's relevance scorer
+   232→    # decides what belongs to the product.
+   233→    for pid in matched_post_ids[:3]:
+   234→        if len(items) >= max_items:
+   235→            break
+   236→        data = client.get("comments/search", {"link_id": pid, "limit": 50, "sort": "asc"})
+   237→        for d in (data or []):
+   238→            add("t1", d)
+   239→
+   240→    status = AdapterStatus.SUCCESS if items else AdapterStatus.NO_RESULTS
+   241→    msg = (f"Collected {len(items)} real Reddit item(s) mentioning '{product_name}' "
+   242→           f"via the public Arctic-Shift archive (recent window across "
+   243→           f"r/{', r/'.join(subreddits[:6])}"
+   244→           f"{'…' if len(subreddits) > 6 else ''}, lookback {settings.REDDIT_LOOKBACK_DAYS}d)"
+   245→           f"{booster_note}.")
+   246→    return AdapterResult("reddit", status, msg, items=items[:max_items], data_source="live")
+   247→
+   248→
+   249→def _clean_comment_body(body: str | None) -> str:
+   250→    """HN comments carry HTML fragments; Reddit bodies are plain text."""
+   251→    if not body:
+   252→        return ""
+   253→    text = html.unescape(body)
+   254→    text = re.sub(r"<[^>]+>", " ", text)
+   255→    return re.sub(r"\s+", " ", text).strip()
+   256→
+   257→
+   258→# ---------------------------------------------------------------- hacker news
+   259→class HackerNewsAdapter(BaseAdapter):
+   260→    """Hacker News discussions via the public Algolia search API (no auth)."""
+   261→
+   262→    key = "hackernews"
+   263→    name = "Hacker News"
+   264→    type = "social"
+   265→    access_mode = "Public HN Algolia search API - no credentials required"
+   266→    required_env: list[str] = []
+   267→    docs_url = "https://hn.algolia.com/api"
+   268→    live_capability = "live"
+   269→    notes = ("Tech-product discussions and comments. Full-text search over stories "
+   270→             "and comment threads; strongest for electronics/software products.")
+   271→
+   272→    BASE = "https://hn.algolia.com/api/v1"
+   273→
+   274→    def search(self, product_name: str, description: str | None,
+   275→               max_items: int) -> AdapterResult:
+   276→        phrase = (product_name or "").strip()
+   277→        if not phrase:
+   278→            return AdapterResult(self.key, AdapterStatus.NO_RESULTS, "Empty product name.")
+   279→        try:
+   280→            stories = requests.get(
+   281→                f"{self.BASE}/search",
+   282→                params={"query": phrase, "tags": "story",
+   283→                        "hitsPerPage": settings.HN_MAX_STORIES},
+   284→                timeout=settings.REQUEST_TIMEOUT_SECONDS,
+   285→            )
+   286→            stories.raise_for_status()
+   287→        except requests.RequestException as exc:
+   288→            return AdapterResult(self.key, AdapterStatus.BLOCKED,
+   289→                                 f"HN Algolia unreachable: {exc}"[:300])
+   290→
+   291→        items: list[ReviewItem] = []
+   292→        seen: set[str] = set()
+   293→
+   294→        def add(ext: str, text: str, created: str | None, author: str | None, url: str | None):
+   295→            text = _clean_comment_body(text)
+   296→            if ext in seen or len(text) < 15:
+   297→                return
+   298→            seen.add(ext)
+   299→            dt = None
+   300→            if created:
+   301→                dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+   302→            items.append(ReviewItem(
+   303→                external_id=ext, text=text[:1500], rating=None,
+   304→                review_date=dt, author=author, source_url=url,
+   305→            ))
+   306→
+   307→        for hit in stories.json().get("hits", []):
+   308→            sid = hit.get("objectID", "")
+   309→            title = hit.get("title") or ""
+   310→            story_text = hit.get("story_text") or ""
+   311→            add(f"story_{sid}", f"{title}. {story_text}",
+   312→                hit.get("created_at"), hit.get("author"),
+   313→                f"https://news.ycombinator.com/item?id={sid}")
+   314→            if len(items) >= max_items:
+   315→                break
+   316→            try:
+   317→                comments = requests.get(
+   318→                    f"{self.BASE}/search",
+   319→                    params={"tags": f"comment,story_{sid}",
+   320→                            "hitsPerPage": settings.HN_COMMENTS_PER_STORY},
+   321→                    timeout=settings.REQUEST_TIMEOUT_SECONDS,
+   322→                )
+   323→                comments.raise_for_status()
+   324→            except requests.RequestException:
+   325→                continue
+   326→            for c in comments.json().get("hits", []):
+   327→                add(f"c_{c.get('objectID', '')}", c.get("comment_text") or "",
+   328→                    c.get("created_at"), c.get("author"),
+   329→                    f"https://news.ycombinator.com/item?id={c.get('objectID', '')}")
+   330→                if len(items) >= max_items:
+   331→                    break
+   332→
+   333→        status = AdapterStatus.SUCCESS if items else AdapterStatus.NO_RESULTS
+   334→        msg = (f"Collected {len(items)} real Hacker News story/comment item(s) via the "
+   335→               f"public Algolia API for '{phrase}'.")
+   336→        return AdapterResult(self.key, status, msg, items=items[:max_items], data_source="live")
+   337→
+   338→
+   339→# ---------------------------------------------------------------- daraz catalog
+   340→DARAZ_UA_HEADERS = {
+   341→    "User-Agent": UA,
+   342→    "Accept": "application/json, text/plain, */*",
+   343→    "Referer": "https://www.daraz.pk/",
+   344→    "Origin": "https://www.daraz.pk",
+   345→}
+   346→
+   347→
+   348→def fetch_daraz_catalog(product_name: str, max_items: int) -> tuple[list[dict], str]:
+   349→    """Query the public Daraz PK storefront catalog JSON.
+   350→
+   351→    Returns (listings, error). Each listing: external_id, name, rating,
+   352→    review_count, price_text, seller, location, brand, url. These are REAL
+   353→    aggregates Daraz serves for its own search UI; review TEXT is not part of
+   354→    this endpoint (needs the Daraz Open Platform API).
+   355→    """
+   356→    try:
+   357→        resp = requests.get(
+   358→            "https://www.daraz.pk/catalog/",
+   359→            params={"q": product_name, "ajax": "true"},
+   360→            headers=DARAZ_UA_HEADERS,
+   361→            timeout=settings.REQUEST_TIMEOUT_SECONDS + 8,
+   362→        )
+   363→        if resp.status_code != 200:
+   364→            return [], f"Daraz catalog HTTP {resp.status_code}"
+   365→        payload = resp.json()
+   366→    except (requests.RequestException, ValueError) as exc:
+   367→        return [], f"Daraz catalog unreachable: {exc}"[:200]
+   368→
+   369→    listings: list[dict] = []
+   370→    for it in (payload.get("mods", {}) or {}).get("listItems", [])[:max_items]:
+   371→        name = (it.get("name") or "").strip()
+   372→        if not name:
+   373→            continue
+   374→        try:
+   375→            rating = float(it.get("ratingScore")) if it.get("ratingScore") not in (None, "", 0) else None
+   376→        except (TypeError, ValueError):
+   377→            rating = None
+   378→        try:
+   379→            review_count = int(str(it.get("review", "0")).replace(",", "")) if it.get("review") else 0
+   380→        except (TypeError, ValueError):
+   381→            review_count = 0
+   382→        price_parts = [p for p in (it.get("priceShow"), it.get("currencyCode") or "PKR") if p]
+   383→        listings.append({
+   384→            "external_id": str(it.get("nid") or it.get("itemId") or name)[:240],
+   385→            "name": name[:280],
+   386→            "rating": rating,
+   387→            "review_count": review_count,
+   388→            "price_text": " ".join(str(p) for p in price_parts)[:120] or None,
+   389→            "seller": (it.get("sellerName") or None),
+   390→            "location": it.get("location"),
+   391→            "brand": it.get("brandName") or None,
+   392→            "url": ("https:" + it["itemUrl"] if str(it.get("itemUrl", "")).startswith("//")
+   393→                    else it.get("itemUrl")),
+   394→            "sold_count_text": it.get("itemSoldCntShow"),
+   395→        })
+   396→    return listings, ""
+   397→
+   398→
+   399→def collect_daraz_catalog(product_name: str, max_items: int) -> tuple[list[dict], str]:
+   400→    return fetch_daraz_catalog(product_name, max_items)
+   401→
+   402→
+   403→def fetch_daraz_reviews(listings: list[dict], max_items: int) -> tuple[list[ReviewItem], str]:
+   404→    """Attempt REAL written reviews for Daraz listings via the PDP review API.
+   405→
+   406→    Verified deployment reality: the storefront review endpoint
+   407→    (`/pdp/review/getReviewList`) currently routes to the SPA error page and
+   408→    the mtop gateway (`acs-m.daraz.pk`) answers RGV587_ERROR (cloud_ip_bl =
+   409→    datacenter IP blocklist), so text reviews are NOT obtainable from this
+   410→    deployment without Daraz Open Platform credentials. The attempt is kept
+   411→    so access resumes automatically if Daraz changes this - and the honest
+   412→    note travels back to the adapter either way.
+   413→    """
+   414→    if not listings:
+   415→        return [], "no catalog listings to look up"
+   416→    note = ""
+   417→    items: list[ReviewItem] = []
+   418→    probe = listings[:3]
+   419→    for l in probe:
+   420→        item_id = str(l.get("external_id") or "")
+   421→        if not item_id.isdigit():
+   422→            continue
+   423→        try:
+   424→            resp = requests.get(
+   425→                "https://www.daraz.pk/pdp/review/getReviewList/",
+   426→                params={"itemId": item_id, "pageSize": 20, "filter": 0,
+   427→                        "sort": 0, "pageNo": 1},
+   428→                headers=DARAZ_UA_HEADERS,
+   429→                timeout=settings.REQUEST_TIMEOUT_SECONDS + 8,
+   430→            )
+   431→            ctype = resp.headers.get("content-type", "")
+   432→            if resp.status_code != 200 or "json" not in ctype:
+   433→                note = ("Daraz written review text is not accessible from this "
+   434→                        "deployment: the storefront review API is protected by "
+   435→                        "Alibaba anti-bot (datacenter IP blocklist) and the review "
+   436→                        "endpoint returns an error page instead of review data.")
+   437→                break
+   438→            payload = resp.json()
+   439→            model = payload.get("model") or {}
+   440→            for r in model.get("items") or []:
+   441→                text = str(r.get("reviewContent") or "").strip()
+   442→                if not text:
+   443→                    continue
+   444→                when = None
+   445→                raw_time = r.get("reviewTime")
+   446→                if raw_time:
+   447→                    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d", "%d-%m-%Y"):
+   448→                        try:
+   449→                            when = datetime.strptime(str(raw_time)[:16], fmt)
+   450→                            break
+   451→                        except ValueError:
+   452→                            continue
+   453→                items.append(ReviewItem(
+   454→                    external_id=f"daz_{r.get('reviewId', len(items))}",
+   455→                    text=text[:1500],
+   456→                    rating=r.get("ratingStar"),
+   457→                    review_date=when,
+   458→                    author=r.get("buyerName"),
+   459→                    variant=str(r.get("skuInfo"))[:160] if r.get("skuInfo") else None,
+   460→                    source_url=l.get("url"),
+   461→                    relevance_hint=0.85,  # product-page reviews are product-scoped
+   462→                ))
+   463→                if len(items) >= max_items:
+   464→                    break
+   465→            if items:
+   466→                note = ""
+   467→                break
+   468→        except (requests.RequestException, ValueError) as exc:
+   469→            note = f"Daraz review endpoint unreachable: {exc}"[:200]
+   470→            break
+   471→    return items[:max_items], note
+   472→
+   473→
+   474→# ---------------------------------------------------------------- youtube innertube
+   475→# The public YouTube web client API (InnerTube) is the same endpoint every
+   476→# YouTube browser session uses (search + comments); it requires no user
+   477→# credentials and returns REAL comments verbatim. When YOUTUBE_API_KEY is
+   478→# configured, the official YouTube Data API v3 is used instead (YouTubeAdapter).
+   479→_INNERTUBE_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"  # public web-client key
+   480→_INNERTUBE_CTX = {"client": {"clientName": "WEB", "clientVersion": "2.20241001.00.00",
+   481→                             "hl": "en", "gl": "PK"}}
+   482→_RELATIVE_AGO = re.compile(
+   483→    r"(\d+)\s+(second|minute|hour|day|week|month|year)s?\s+ago", re.I)
+   484→
+   485→
+   486→def _parse_relative_time(text: str | None):
+   487→    """Best-effort parse of YouTube relative timestamps ('7 months ago')."""
+   488→    if not text:
+   489→        return None
+   490→    m = _RELATIVE_AGO.search(text)
+   491→    if not m:
+   492→        return None
+   493→    n, unit = int(m.group(1)), m.group(2).lower()
+   494→    deltas = {"second": timedelta(seconds=n), "minute": timedelta(minutes=n),
+   495→              "hour": timedelta(hours=n), "day": timedelta(days=n),
+   496→              "week": timedelta(weeks=n), "month": timedelta(days=30 * n),
+   497→              "year": timedelta(days=365 * n)}
+   498→    return datetime.now(timezone.utc) - deltas[unit]
+   499→
+   500→
+   501→class YouTubeInnertubeClient:
+   502→    """Real YouTube comments via the public web client API (no credentials).
+   503→
+   504→    Rate-limited politely (min interval between calls), retries transient
+   505→    failures with exponential backoff, and degrades gracefully: a video with
+   506→    comments disabled is skipped, a network error aborts with what was
+   507→    collected so far.
+   508→    """
+   509→
+   510→    SEARCH_URL = f"https://www.youtube.com/youtubei/v1/search?key={_INNERTUBE_KEY}&prettyPrint=false"
+   511→    NEXT_URL = f"https://www.youtube.com/youtubei/v1/next?key={_INNERTUBE_KEY}&prettyPrint=false"
+   512→
+   513→    def __init__(self) -> None:
+   514→        self._last_call = 0.0
+   515→        self.calls = 0
+   516→
+   517→    def _post(self, url: str, payload: dict) -> dict | None:
+   518→        wait = settings.INNERTUBE_MIN_INTERVAL_SECONDS - (time.time() - self._last_call)
+   519→        if wait > 0:
+   520→            time.sleep(wait)
+   521→        backoff = 1.5
+   522→        for attempt in range(3):
+   523→            self.calls += 1
+   524→            self._last_call = time.time()
+   525→            try:
+   526→                resp = requests.post(
+   527→                    url, json=payload, timeout=settings.REQUEST_TIMEOUT_SECONDS + 10,
+   528→                    headers={"User-Agent": UA,
+   529→                             "Content-Type": "application/json",
+   530→                             "Accept-Language": "en-US,en;q=0.9",
+   531→                             "Origin": "https://www.youtube.com",
+   532→                             "Referer": "https://www.youtube.com/"},
+   533→                )
+   534→                if resp.status_code == 200:
+   535→                    return resp.json()
+   536→                if resp.status_code in (429, 500, 502, 503) and attempt < 2:
+   537→                    time.sleep(backoff)
+   538→                    backoff *= 2
+   539→                    continue
+   540→                log.warning("innertube HTTP %s on %s", resp.status_code, url.split("/v1/")[1][:20])
+   541→                return None
+   542→            except requests.RequestException as exc:
+   543→                log.warning("innertube network error: %s", exc)
+   544→                if attempt < 2:
+   545→                    time.sleep(backoff)
+   546→                    backoff *= 2
+   547→        return None
+   548→
+   549→    @staticmethod
+   550→    def _walk(node, key: str):
+   551→        if isinstance(node, dict):
+   552→            for k, v in node.items():
+   553→                if k == key:
+   554→                    yield v
+   555→                yield from YouTubeInnertubeClient._walk(v, key)
+   556→        elif isinstance(node, list):
+   557→            for it in node:
+   558→                yield from YouTubeInnertubeClient._walk(it, key)
+   559→
+   560→    def search_videos(self, query: str, limit: int) -> list[dict]:
+   561→        payload = {"context": _INNERTUBE_CTX, "query": query}
+   562→        data = self._post(self.SEARCH_URL, payload)
+   563→        if not data:
+   564→            return []
+   565→        videos: list[dict] = []
+   566→        seen: set[str] = set()
+   567→        for vr in self._walk(data, "videoRenderer"):
+   568→            vid = vr.get("videoId")
+   569→            if not vid or vid in seen:
+   570→                continue
+   571→            seen.add(vid)
+   572→            title = ""
+   573→            runs = ((vr.get("title") or {}).get("runs")) or []
+   574→            title = runs[0].get("text", "") if runs else ""
+   575→            owner_runs = ((vr.get("ownerText") or {}).get("runs")) or []
+   576→            videos.append({
+   577→                "video_id": vid,
+   578→                "title": title[:300],
+   579→                "channel": owner_runs[0].get("text", "")[:120] if owner_runs else None,
+   580→                "views_text": (vr.get("viewCountText") or {}).get("simpleText"),
+   581→                "published_text": (vr.get("publishedTimeText") or {}).get("simpleText"),
+   582→            })
+   583→            if len(videos) >= limit:
+   584→                break
+   585→        return videos
+   586→
+   587→    def _comments_continuation(self, data: dict) -> str | None:
+   588→        """Find the comments-section continuation token in a /next response."""
+   589→        for ep in data.get("engagementPanels", []):
+   590→            panel = ep.get("engagementPanelSectionListRenderer", {})
+   591→            if panel.get("panelIdentifier") != "engagement-panel-comments-section":
+   592→                continue
+   593→
+   594→            def find_cont(node):
+   595→                if isinstance(node, dict):
+   596→                    cir = node.get("continuationItemRenderer")
+   597→                    if cir:
+   598→                        tok = ((cir.get("continuationEndpoint") or {})
+   599→                               .get("continuationCommand", {}) or {}).get("token")
+   600→                        if tok:
+   601→                            return tok
+   602→                    for v in node.values():
+   603→                        found = find_cont(v)
+   604→                        if found:
+   605→                            return found
+   606→                elif isinstance(node, list):
+   607→                    for it in node:
+   608→                        found = find_cont(it)
+   609→                        if found:
+   610→                            return found
+   611→                return None
+   612→
+   613→            token = find_cont(panel.get("content", {}))
+   614→            if token:
+   615→                return token
+   616→        return None
+   617→
+   618→    def fetch_comments(self, video_id: str, want: int,
+   619→                       seen_ids: set[str] | None = None) -> tuple[list[dict], int]:
+   620→        """Collect real comments (top-level) for one video. Returns (comments, remaining_want)."""
+   621→        seen = seen_ids if seen_ids is not None else set()
+   622→        out: list[dict] = []
+   623→        token = None
+   624→        first = self._post(self.NEXT_URL, {"context": _INNERTUBE_CTX, "videoId": video_id})
+   625→        if not first:
+   626→            return out, want
+   627→        token = self._comments_continuation(first)
+   628→        pages = 0
+   629→        while token and pages < settings.YOUTUBE_MAX_PAGES_PER_VIDEO and len(out) < want:
+   630→            data = self._post(self.NEXT_URL, {"context": _INNERTUBE_CTX, "continuation": token})
+   631→            if not data:
+   632→                break
+   633→            pages += 1
+   634→            before = len(out)
+   635→            # New format: commentEntityPayload mutations (author, text, likes, time)
+   636→            for mut in ((data.get("frameworkUpdates") or {})
+   637→                        .get("entityBatchUpdate", {}) or {}).get("mutations", []):
+   638→                p = (mut.get("payload") or {}).get("commentEntityPayload")
+   639→                if not p:
+   640→                    continue
+   641→                cid = ((p.get("properties") or {}).get("commentId")) or mut.get("entityKey", "")
+   642→                if not cid or cid in seen:
+   643→                    continue
+   644→                text = (((p.get("properties") or {}).get("content") or {})
+   645→                        .get("content") or "").strip()
+   646→                if len(text) < 2:
+   647→                    continue
+   648→                seen.add(cid)
+   649→                author = ((p.get("author") or {}).get("displayName")) or None
+   650→                when = _parse_relative_time((p.get("properties") or {}).get("publishedTime"))
+   651→                likes_raw = ((p.get("toolbar") or {}).get("likeCountNotliked")) or ""
+   652→                try:
+   653→                    likes = int(str(likes_raw).replace(",", "")) if likes_raw else None
+   654→                except ValueError:
+   655→                    likes = None
+   656→                out.append({"id": f"yt_{cid[:200]}", "text": text, "author": author,
+   657→                            "likes": likes, "date": when, "video_id": video_id})
+   658→            # next page token: last continuationItemRenderer in the append action
+   659→            next_token = None
+   660→            for ep in data.get("onResponseReceivedEndpoints", []):
+   661→                action = ep.get("appendContinuationItemsAction") or \
+   662→                    ep.get("reloadContinuationItemsCommand") or {}
+   663→                items = action.get("continuationItems") or []
+   664→                if items:
+   665→                    cir = items[-1].get("continuationItemRenderer") or {}
+   666→                    tok = ((cir.get("continuationEndpoint") or {})
+   667→                           .get("continuationCommand", {}) or {}).get("token")
+   668→                    if tok:
+   669→                        next_token = tok
+   670→            token = next_token
+   671→            if len(out) == before:  # page yielded nothing new
+   672→                break
+   673→        return out, max(0, want - len(out))
+   674→
+   675→
+   676→def collect_youtube(product_name: str, description: str | None,
+   677→                    max_items: int) -> AdapterResult:
+   678→    """Collect REAL YouTube comments for the product via the public web API.
+   679→
+   680→    Searches product review videos, then harvests top-level comments across
+   681→    the top videos until max_items is reached. No synthetic content.
+   682→    """
+   683→    if not (product_name or "").strip():
+   684→        return AdapterResult("youtube", AdapterStatus.NO_RESULTS, "Empty product name.")
+   685→    client = YouTubeInnertubeClient()
+   686→    query = f"{product_name} review" if len(product_name) < 25 else product_name
+   687→    videos = client.search_videos(query, settings.YOUTUBE_MAX_VIDEOS)
+   688→    if not videos:
+   689→        return AdapterResult(
+   690→            "youtube", AdapterStatus.BLOCKED,
+   691→            "YouTube web API unreachable from this deployment (no videos returned).")
+   692→
+   693→    items: list[ReviewItem] = []
+   694→    seen_ids: set[str] = set()
+   695→    per_video = settings.YOUTUBE_COMMENTS_PER_VIDEO
+   696→    video_meta: dict[str, dict] = {}
+   697→    for v in videos:
+   698→        if len(items) >= max_items:
+   699→            break
+   700→        comments, _ = client.fetch_comments(v["video_id"],
+   701→                                            min(per_video, max_items - len(items)), seen_ids)
+   702→        url = f"https://www.youtube.com/watch?v={v['video_id']}"
+   703→        video_meta[v["video_id"]] = {
+   704→            "external_id": v["video_id"],
+   705→            "name": v.get("title") or f"YouTube video {v['video_id']}",
+   706→            "url": url,
+   707→            "seller": v.get("channel"),          # channel name
+   708→            "sold_count_text": v.get("views_text"),   # views, as shown on YouTube
+   709→            "review_count": len(comments),       # comments collected from this video
+   710→        }
+   711→        for c in comments:
+   712→            if len(items) >= max_items:
+   713→                break
+   714→            items.append(ReviewItem(
+   715→                external_id=c["id"],
+   716→                text=c["text"][:1500],
+   717→                review_date=c.get("date"),
+   718→                author=c.get("author"),
+   719→                source_url=url,
+   720→                variant=(v.get("title") or None),  # source video title, shown per comment
+   721→                # Comments were harvested from videos retrieved by a
+   722→                # product-scoped search ("{product} review"), so the product
+   723→                # context comes from the video level - the same rationale as
+   724→                # marketplace product-page items. Token-level relevance scoring
+   725→                # would wrongly discard e.g. "I love GM brava 808" under a
+   726→                # cricket-bat review video. Spam/promotional filtering and all
+   727→                # other pipeline quality gates still apply downstream.
+   728→                relevance_hint=0.6,
+   729→            ))
+   730→
+   731→    status = AdapterStatus.SUCCESS if items else AdapterStatus.NO_RESULTS
+   732→    msg = (f"Collected {len(items)} real YouTube comments across {len(video_meta)} "
+   733→           f"review video(s) for '{query}' via the public YouTube web API. "
+   734→           "Each comment links to the video it came from; the dashboard lists "
+   735→           "all source videos.")
+   736→    result = AdapterResult("youtube", status, msg, items=items[:max_items],
+   737→                           data_source="live")
+   738→    # Persist source-video metadata through the standard platform-entities
+   739→    # table so the report can show where every comment came from.
+   740→    result.aggregate_items = list(video_meta.values())
+   741→    return result
+   742→

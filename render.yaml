@@ -1,0 +1,46 @@
+services:
+  - type: web
+    name: tubescout-backend
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: DIRECT_URL
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: YOUTUBE_API_KEY
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: LLM_API_BASE
+        sync: false
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_MODEL
+        value: gemini-3.5-flash
+      - key: LLM_TIMEOUT_SECONDS
+        value: "60"
+      - key: OAUTH_REDIRECT_URI
+        sync: false
+      - key: ENVIRONMENT
+        value: production
+      - key: DEFAULT_MARKET
+        value: PK
+      - key: DEFAULT_CURRENCY
+        value: PKR
+
+  - type: web
+    name: tubescout-frontend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/py-health
+    envVars:
+      - key: BACKEND_URL
+        sync: false

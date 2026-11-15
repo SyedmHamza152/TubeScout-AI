@@ -10,6 +10,9 @@ const HOP_BY_HOP = new Set([
 ]);
 
 async function proxy(request: NextRequest, ctx: { params: Promise<{ path: string[] }> }) {
+  if (process.env.NODE_ENV === "production" && !process.env.BACKEND_URL) {
+    return NextResponse.json({ detail: "BACKEND_URL is not configured on the frontend service." }, { status: 503 });
+  }
   const { path } = await ctx.params;
   const incoming = new URL(request.url);
   incoming.searchParams.delete("XTransformPort");
@@ -23,7 +26,12 @@ async function proxy(request: NextRequest, ctx: { params: Promise<{ path: string
     init.body = await request.arrayBuffer();
   }
 
-  const upstream = await fetch(target, init);
+  let upstream: Response;
+  try {
+    upstream = await fetch(target, init);
+  } catch {
+    return NextResponse.json({ detail: `Backend unreachable at ${BACKEND}` }, { status: 502 });
+  }
   const out = new Headers(upstream.headers);
   for (const h of HOP_BY_HOP) out.delete(h);
   out.delete("content-encoding");

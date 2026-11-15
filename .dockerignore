@@ -1,7 +1,13 @@
 node_modules
 .next
 audit
-backend
+db
+upload
+download
+tool-results
+examples
+mini-services
+prisma
 .git
 *.log
 dev.log
@@ -9,6 +15,11 @@ server.log
 **/.env
 **/.env.*
 !.env.example
+**/.venv
+**/__pycache__
+*.pyc
+backend/data
 Dockerfile
 .dockerignore
+docker-compose.yml
 render.yaml
